@@ -88,6 +88,12 @@ typedef g2o::LinearSolverCSparse<SlamBlockSolver::PoseMatrixType> SlamLinearCSpa
 typedef g2o::LinearSolverCholmod<SlamBlockSolver::PoseMatrixType> SlamLinearCholmodSolver;
 #endif
 
+#ifdef G2O_SRC_DIR
+namespace g2o {
+typedef VertexPointXYZ VertexSBAPointXYZ;
+}
+#endif
+
 #if defined(RTABMAP_VERTIGO)
 #include "vertigo/g2o/edge_switchPrior.h"
 #include "vertigo/g2o/edge_se2Switchable.h"
@@ -1496,6 +1502,11 @@ std::map<int, Transform> OptimizerG2O::optimizeBA(
 			if(points3DMap.find(id) != points3DMap.end())
 			{
 				cv::Point3f pt3d = points3DMap.at(id);
+				if(!util3d::isFinite(pt3d))
+				{
+					UWARN("Ignoring 3D point %d because it has nan value(s)!", id);
+					continue;
+				}
 				g2o::VertexSBAPointXYZ* vpt3d = new g2o::VertexSBAPointXYZ();
 
 				vpt3d->setEstimate(Eigen::Vector3d(pt3d.x, pt3d.y, pt3d.z));
@@ -1522,7 +1533,7 @@ std::map<int, Transform> OptimizerG2O::optimizeBA(
 						const FeatureBA & pt = jter->second;
 						double depth = pt.depth;
 
-						//UDEBUG("Added observation pt=%d to cam=%d (%f,%f) depth=%f", vpt3d->id()-stepVertexId, camId, pt.x, pt.y, depth);
+						//UDEBUG("Added observation pt=%d to cam=%d (%d,%d) depth=%f", vpt3d->id()-stepVertexId, camId, (int)pt.kpt.pt.x, (int)pt.kpt.pt.y, depth);
 
 						g2o::OptimizableGraph::Edge * e;
 						double baseline = 0.0;
@@ -1568,9 +1579,9 @@ std::map<int, Transform> OptimizerG2O::optimizeBA(
 							if(baseline > 0.0)
 							{
 								UDEBUG("Stereo camera model detected but current "
-										"observation (pt=%d to cam=%d) has null depth (%f m), adding "
+										"observation (pt=%d to cam=%d, kpt=[%d,%d]) has null depth (%f m), adding "
 										"mono observation instead.",
-										vpt3d->id()-stepVertexId, camId, depth);
+										vpt3d->id()-stepVertexId, camId, (int)pt.kpt.pt.x, (int)pt.kpt.pt.y, depth);
 							}
 							// mono edge
 #ifdef RTABMAP_ORB_SLAM2

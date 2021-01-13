@@ -120,7 +120,7 @@ public:
 
 	virtual QString getIniFilePath() const;
 	virtual QString getTmpIniFilePath() const;
-	void init();
+	void init(const QString & iniFilePath = "");
 	void setCurrentPanelToSource();
 	virtual QString getDefaultWorkingDirectory() const;
 
@@ -249,6 +249,7 @@ public:
 	QString getSourceDevice() const;
 
 	bool isSourceDatabaseStampsUsed() const;
+	bool isSourceDatabaseStereoToDepth() const;
 	bool isSourceRGBDColorOnly() const;
 	int getIMUFilteringStrategy() const;
 	bool isDepthFilteringAvailable() const;
@@ -266,7 +267,7 @@ public:
 	double getSourceScanVoxelSize() const;
 	int getSourceScanNormalsK() const;
 	double getSourceScanNormalsRadius() const;
-	bool isSourceScanForceGroundNormalsUp() const;
+	double getSourceScanForceGroundNormalsUp() const;
 	Transform getSourceLocalTransform() const;    //Openni group
 	Transform getLaserLocalTransform() const; // directory images
 	Transform getIMULocalTransform() const; // directory images
@@ -307,7 +308,7 @@ public Q_SLOTS:
 	void setDetectionRate(double value);
 	void setTimeLimit(float value);
 	void setSLAMMode(bool enabled);
-	void selectSourceDriver(Src src);
+	void selectSourceDriver(Src src, int variant = 0);
 	void calibrate();
 	void calibrateSimple();
 

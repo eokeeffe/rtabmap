@@ -35,6 +35,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <rtabmap/utilite/UMath.h>
 #include <rtabmap/utilite/UConversion.h>
 #include <rtabmap/utilite/UStl.h>
+#include <rtabmap/core/util2d.h>
 #include <pcl/visualization/pcl_visualizer.h>
 #include <pcl/common/transforms.h>
 #include <QMenu>
@@ -130,11 +131,15 @@ CloudViewer::CloudViewer(QWidget *parent, CloudViewerInteractorStyle * style) :
 		_frontfaceCulling(false),
 		_renderingRate(5.0),
 		_octomapActor(0),
-		_intensityAbsMax(0.0f)
+		_intensityAbsMax(0.0f),
+		_coordinateFrameScale(1.0)
 {
 	UDEBUG("");
 	this->setMinimumSize(200, 200);
-
+#if VTK_MAJOR_VERSION >= 8
+	vtkObject::GlobalWarningDisplayOff();
+#endif
+	
 	int argc = 0;
 	UASSERT(style!=0);
 	style->setCloudViewer(this);
@@ -264,6 +269,8 @@ void CloudViewer::createMenu()
 	_aShowCameraAxis= new QAction("Show base frame", this);
 	_aShowCameraAxis->setCheckable(true);
 	_aShowCameraAxis->setChecked(true);
+	_aSetFrameScale= new QAction("Set frame scale...", this);
+	_aShowCameraAxis->setChecked(true);
 	_aShowFrustum= new QAction("Show frustum", this);
 	_aShowFrustum->setCheckable(true);
 	_aShowFrustum->setChecked(false);
@@ -280,6 +287,9 @@ void CloudViewer::createMenu()
 	_aSetIntensityRedColormap = new QAction("Red/Yellow Colormap", this);
 	_aSetIntensityRedColormap->setCheckable(true);
 	_aSetIntensityRedColormap->setChecked(false);
+	_aSetIntensityRainbowColormap = new QAction("Rainbow Colormap", this);
+	_aSetIntensityRainbowColormap->setCheckable(true);
+	_aSetIntensityRainbowColormap->setChecked(false);
 	_aSetIntensityMaximum = new QAction("Set maximum absolute intensity...", this);
 	_aSetBackgroundColor = new QAction("Set background color...", this);	
 	_aSetRenderingRate = new QAction("Set rendering rate...", this);
@@ -338,8 +348,9 @@ void CloudViewer::createMenu()
 	normalsMenu->addAction(_aSetNormalsStep);
 	normalsMenu->addAction(_aSetNormalsScale);
 
-	QMenu * scanMenu = new QMenu("Scan", this);
+	QMenu * scanMenu = new QMenu("Scan color", this);
 	scanMenu->addAction(_aSetIntensityRedColormap);
+	scanMenu->addAction(_aSetIntensityRainbowColormap);
 	scanMenu->addAction(_aSetIntensityMaximum);
 
 	//menus
@@ -347,6 +358,7 @@ void CloudViewer::createMenu()
 	_menu->addMenu(cameraMenu);
 	_menu->addMenu(trajectoryMenu);
 	_menu->addAction(_aShowCameraAxis);
+	_menu->addAction(_aSetFrameScale);
 	_menu->addMenu(frustumMenu);
 	_menu->addMenu(gridMenu);
 	_menu->addMenu(normalsMenu);
@@ -400,12 +412,14 @@ void CloudViewer::saveSettings(QSettings & settings, const QString & group) cons
 	settings.setValue("normals_scale", (double)this->getNormalsScale());
 
 	settings.setValue("intensity_red_colormap", this->isIntensityRedColormap());
+	settings.setValue("intensity_rainbow_colormap", this->isIntensityRainbowColormap());
 	settings.setValue("intensity_max", (double)this->getIntensityMax());
 
 	settings.setValue("trajectory_shown", this->isTrajectoryShown());
 	settings.setValue("trajectory_size", this->getTrajectorySize());
 
 	settings.setValue("camera_axis_shown", this->isCameraAxisShown());
+	settings.setValue("coordinate_frame_scale", this->getCoordinateFrameScale());
 
 	settings.setValue("frustum_shown", this->isFrustumShown());
 	settings.setValue("frustum_scale", this->getFrustumScale());
@@ -449,12 +463,14 @@ void CloudViewer::loadSettings(QSettings & settings, const QString & group)
 	this->setNormalsScale(settings.value("normals_scale", this->getNormalsScale()).toFloat());
 
 	this->setIntensityRedColormap(settings.value("intensity_red_colormap", this->isIntensityRedColormap()).toBool());
+	this->setIntensityRainbowColormap(settings.value("intensity_rainbow_colormap", this->isIntensityRainbowColormap()).toBool());
 	this->setIntensityMax(settings.value("intensity_max", this->getIntensityMax()).toFloat());
 
 	this->setTrajectoryShown(settings.value("trajectory_shown", this->isTrajectoryShown()).toBool());
 	this->setTrajectorySize(settings.value("trajectory_size", this->getTrajectorySize()).toUInt());
 
 	this->setCameraAxisShown(settings.value("camera_axis_shown", this->isCameraAxisShown()).toBool());
+	this->setCoordinateFrameScale(settings.value("coordinate_frame_scale", this->getCoordinateFrameScale()).toDouble());
 
 	this->setFrustumShown(settings.value("frustum_shown", this->isFrustumShown()).toBool());
 	this->setFrustumScale(settings.value("frustum_scale", this->getFrustumScale()).toDouble());
@@ -489,20 +505,43 @@ bool CloudViewer::updateCloudPose(
 		//UDEBUG("Updating pose %s to %s", id.c_str(), pose.prettyPrint().c_str());
 		bool samePose = _addedClouds.find(id).value() == pose;
 		Eigen::Affine3f posef = pose.toEigen3f();
-		if(samePose ||
-		   _visualizer->updatePointCloudPose(id, posef))
+		if(!samePose)
 		{
-			_addedClouds.find(id).value() = pose;
-			if(!samePose)
+			// PointCloud / Mesh
+			bool updated = _visualizer->updatePointCloudPose(id, posef);
+
+#if VTK_MAJOR_VERSION >= 7
+			if(!updated)
 			{
+				// TextureMesh, cannot use updateShapePose because it searches for vtkLODActor, not a vtkActor
+				pcl::visualization::ShapeActorMap::iterator am_it = _visualizer->getShapeActorMap()->find (id);
+				vtkActor* actor;
+				if (am_it != _visualizer->getShapeActorMap()->end ())
+				{
+					actor = vtkActor::SafeDownCast (am_it->second);
+					if (actor)
+					{
+						vtkSmartPointer<vtkMatrix4x4> matrix = vtkSmartPointer<vtkMatrix4x4>::New ();
+						pcl::visualization::PCLVisualizer::convertToVtkMatrix (pose.toEigen3f().matrix (), matrix);
+						actor->SetUserMatrix (matrix);
+						actor->Modified ();
+						updated = true;
+					}
+				}
+			}
+#endif
+
+			if(updated)
+			{
+				_addedClouds.find(id).value() = pose;
 				std::string idNormals = id+"-normals";
 				if(_addedClouds.find(idNormals)!=_addedClouds.end())
 				{
 					_visualizer->updatePointCloudPose(idNormals, posef);
 					_addedClouds.find(idNormals).value() = pose;
 				}
+				return true;
 			}
-			return true;
 		}
 	}
 	return false;
@@ -519,10 +558,10 @@ public:
 	typedef boost::shared_ptr<const PointCloudColorHandlerIntensityField > ConstPtr;
 
 	/** \brief Constructor. */
-	PointCloudColorHandlerIntensityField (const PointCloudConstPtr &cloud, float maxAbsIntensity = 0.0f, bool redYellowColormap = true) :
+	PointCloudColorHandlerIntensityField (const PointCloudConstPtr &cloud, float maxAbsIntensity = 0.0f, int colorMap = 0) :
 		pcl::visualization::PointCloudColorHandler<pcl::PCLPointCloud2>::PointCloudColorHandler (cloud),
 		maxAbsIntensity_(maxAbsIntensity),
-		redColormap_(redYellowColormap)
+		colormap_(colorMap)
 		{
 		field_idx_  = pcl::getFieldIndex (*cloud, "intensity");
 		if (field_idx_ != -1)
@@ -539,12 +578,16 @@ public:
 	 * \return true if the operation was successful (the handler is capable and
 	 * the input cloud was given as a valid pointer), false otherwise
 	 */
-	virtual bool
-	getColor (vtkSmartPointer<vtkDataArray> &scalars) const
-	{
+#if PCL_VERSION_COMPARE(>, 1, 11, 1)
+	virtual vtkSmartPointer<vtkDataArray> getColor () const {
+		vtkSmartPointer<vtkDataArray> scalars;
+		if (!capable_ || !cloud_)
+			return scalars;
+#else
+	virtual bool getColor (vtkSmartPointer<vtkDataArray> &scalars) const {
 		if (!capable_ || !cloud_)
 			return (false);
-
+#endif
 		if (!scalars)
 			scalars = vtkSmartPointer<vtkUnsignedCharArray>::New ();
 		scalars->SetNumberOfComponents (3);
@@ -609,10 +652,18 @@ public:
 			for(size_t k=0; k<j; ++k)
 			{
 				colors[k*3+0] = colors[k*3+1] = colors[k*3+2] = max>0?(unsigned char)(std::min(intensities[k]/max*255.0f, 255.0f)):255;
-				if(redColormap_)
+				if(colormap_ == 1)
 				{
 					colors[k*3+0] = 255;
 					colors[k*3+2] = 0;
+				}
+				else if(colormap_ == 2)
+				{
+					float r,g,b;
+					util2d::HSVtoRGB(&r, &g, &b, colors[k*3+0]*299.0f/255.0f, 1.0f, 1.0f);
+					colors[k*3+0] = r*255.0f;
+					colors[k*3+1] = g*255.0f;
+					colors[k*3+2] = b*255.0f;
 				}
 			}
 			reinterpret_cast<vtkUnsignedCharArray*>(&(*scalars))->SetNumberOfTuples (j);
@@ -622,7 +673,11 @@ public:
 			reinterpret_cast<vtkUnsignedCharArray*>(&(*scalars))->SetNumberOfTuples (0);
 		//delete [] colors;
 		delete [] intensities;
+#if PCL_VERSION_COMPARE(>, 1, 11, 1)
+		return scalars;
+#else
 		return (true);
+#endif
 	}
 
 protected:
@@ -636,7 +691,7 @@ protected:
 
 private:
 	float maxAbsIntensity_;
-	bool redColormap_;
+	int colormap_; // 0=grayscale, 1=redYellow, 2=RainbowHSV
 };
 
 bool CloudViewer::addCloud(
@@ -701,7 +756,7 @@ bool CloudViewer::addCloud(
 		else if(hasIntensity)
 		{
 			//intensity
-			colorHandler.reset(new PointCloudColorHandlerIntensityField(binaryCloud, _intensityAbsMax, _aSetIntensityRedColormap->isChecked()));
+			colorHandler.reset(new PointCloudColorHandlerIntensityField(binaryCloud, _intensityAbsMax, _aSetIntensityRedColormap->isChecked()?1:_aSetIntensityRainbowColormap->isChecked()?2:0));
 			_visualizer->addPointCloud (binaryCloud, colorHandler, origin, orientation, id, viewport);
 		}
 		else if(previousColorIndex == 5)
@@ -831,7 +886,11 @@ bool CloudViewer::addCloudMesh(
 	UDEBUG("Adding %s with %d points and %d polygons", id.c_str(), (int)cloud->size(), (int)polygons.size());
 	if(_visualizer->addPolygonMesh<pcl::PointXYZ>(cloud, polygons, id, 1))
 	{
+#if VTK_MAJOR_VERSION >= 7
+		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetAmbient(0.1);
+#else
 		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetAmbient(0.5);
+#endif
 		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetLighting(_aSetLighting->isChecked());
 		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetInterpolation(_aSetFlatShading->isChecked()?VTK_FLAT:VTK_PHONG);
 		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetEdgeVisibility(_aSetEdgeVisibility->isChecked());
@@ -865,7 +924,11 @@ bool CloudViewer::addCloudMesh(
 	UDEBUG("Adding %s with %d points and %d polygons", id.c_str(), (int)cloud->size(), (int)polygons.size());
 	if(_visualizer->addPolygonMesh<pcl::PointXYZRGB>(cloud, polygons, id, 1))
 	{
+#if VTK_MAJOR_VERSION >= 7
+		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetAmbient(0.1);
+#else
 		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetAmbient(0.5);
+#endif
 		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetLighting(_aSetLighting->isChecked());
 		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetInterpolation(_aSetFlatShading->isChecked()?VTK_FLAT:VTK_PHONG);
 		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetEdgeVisibility(_aSetEdgeVisibility->isChecked());
@@ -899,7 +962,11 @@ bool CloudViewer::addCloudMesh(
 	UDEBUG("Adding %s with %d points and %d polygons", id.c_str(), (int)cloud->size(), (int)polygons.size());
 	if(_visualizer->addPolygonMesh<pcl::PointXYZRGBNormal>(cloud, polygons, id, 1))
 	{
+#if VTK_MAJOR_VERSION >= 7
+		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetAmbient(0.1);
+#else
 		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetAmbient(0.5);
+#endif
 		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetLighting(_aSetLighting->isChecked());
 		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetInterpolation(_aSetFlatShading->isChecked()?VTK_FLAT:VTK_PHONG);
 		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetEdgeVisibility(_aSetEdgeVisibility->isChecked());
@@ -932,7 +999,11 @@ bool CloudViewer::addCloudMesh(
 	UDEBUG("Adding %s with %d polygons", id.c_str(), (int)mesh->polygons.size());
 	if(_visualizer->addPolygonMesh(*mesh, id, 1))
 	{
+#if VTK_MAJOR_VERSION >= 7
+		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetAmbient(0.1);
+#else
 		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetAmbient(0.5);
+#endif
 		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetLighting(_aSetLighting->isChecked());
 		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetEdgeVisibility(_aSetEdgeVisibility->isChecked());
 		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetBackfaceCulling(_aBackfaceCulling->isChecked());
@@ -966,25 +1037,26 @@ bool CloudViewer::addCloudTextureMesh(
 	UDEBUG("Adding %s", id.c_str());
 	if(this->addTextureMesh(*textureMesh, texture, id, 1))
 	{
-		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetLighting(_aSetLighting->isChecked());
-		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetInterpolation(_aSetFlatShading->isChecked()?VTK_FLAT:VTK_PHONG);
-		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetEdgeVisibility(_aSetEdgeVisibility->isChecked());
-		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetBackfaceCulling(_aBackfaceCulling->isChecked());
-		_visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetFrontfaceCulling(_frontfaceCulling);
+#if VTK_MAJOR_VERSION >= 7
+		vtkActor* actor = vtkActor::SafeDownCast (_visualizer->getShapeActorMap()->find(id)->second);
+#else
+		vtkActor* actor = vtkActor::SafeDownCast (_visualizer->getCloudActorMap()->find(id)->second.actor);
+#endif
+		UASSERT(actor);
 		if(!textureMesh->cloud.is_dense)
 		{
-			_visualizer->getCloudActorMap()->find(id)->second.actor->GetTexture()->SetInterpolate(1);
-			_visualizer->getCloudActorMap()->find(id)->second.actor->GetTexture()->SetBlendingMode(vtkTexture::VTK_TEXTURE_BLENDING_MODE_REPLACE);
+			actor->GetTexture()->SetInterpolate(1);
+			actor->GetTexture()->SetBlendingMode(vtkTexture::VTK_TEXTURE_BLENDING_MODE_REPLACE);
 		}
-		_visualizer->updatePointCloudPose(id, pose.toEigen3f());
 		if(_buildLocator)
 		{
 			vtkSmartPointer<vtkOBBTree> tree = vtkSmartPointer<vtkOBBTree>::New();
-			tree->SetDataSet(_visualizer->getCloudActorMap()->find(id)->second.actor->GetMapper()->GetInput());
+			tree->SetDataSet(actor->GetMapper()->GetInput());
 			tree->BuildLocator();
 			_locators.insert(std::make_pair(id, tree));
 		}
-		_addedClouds.insert(id, pose);
+		_addedClouds.insert(id, Transform::getIdentity());
+		this->updateCloudPose(id, pose);
 		return true;
 	}
 	return false;
@@ -1139,7 +1211,7 @@ bool CloudViewer::addOctomap(const OctoMap * octomap, unsigned int treeDepth, bo
 							// Gradiant color on z axis
 							float H = (maxZ - pt.z())*299.0f/(maxZ-minZ);
 							float r,g,b;
-							OctoMap::HSVtoRGB(&r, &g, &b, H, 1, 1);
+							util2d::HSVtoRGB(&r, &g, &b, H, 1, 1);
 							pixel[0] = r*255.0f;
 							pixel[1] = g*255.0f;
 							pixel[2] = b*255.0f;
@@ -1223,8 +1295,13 @@ bool CloudViewer::addTextureMesh (
 {
 	// Copied from PCL 1.8, modified to ignore vertex color and accept only one material (loaded from memory instead of file)
 
+#if VTK_MAJOR_VERSION >= 7
+  pcl::visualization::ShapeActorMap::iterator am_it = _visualizer->getShapeActorMap()->find (id);
+  if (am_it != _visualizer->getShapeActorMap()->end ())
+#else
   pcl::visualization::CloudActorMap::iterator am_it = _visualizer->getCloudActorMap()->find (id);
   if (am_it != _visualizer->getCloudActorMap()->end ())
+#endif
   {
     PCL_ERROR ("[PCLVisualizer::addTextureMesh] A shape with id <%s> already exists!"
                " Please choose a different id and retry.\n",
@@ -1325,7 +1402,11 @@ bool CloudViewer::addTextureMesh (
     mapper->SetInputData (polydata);
 #endif
 
+#if VTK_MAJOR_VERSION >= 7
+  vtkSmartPointer<vtkActor> actor = vtkSmartPointer<vtkActor>::New ();
+#else
   vtkSmartPointer<vtkLODActor> actor = vtkSmartPointer<vtkLODActor>::New ();
+#endif
   vtkTextureUnitManager* tex_manager = vtkOpenGLRenderWindow::SafeDownCast (_visualizer->getRenderWindow())->GetTextureUnitManager ();
     if (!tex_manager)
       return (false);
@@ -1374,17 +1455,24 @@ bool CloudViewer::addTextureMesh (
 	}
 
   // Save the pointer/ID pair to the global actor map
+#if VTK_MAJOR_VERSION >= 7
+  (*_visualizer->getShapeActorMap())[id] = actor;
+#else
   (*_visualizer->getCloudActorMap())[id].actor = actor;
-
-  // Save the viewpoint transformation matrix to the global actor map
+   // Save the viewpoint transformation matrix to the global actor map
   (*_visualizer->getCloudActorMap())[id].viewpoint_transformation_ = transformation;
+#endif
 
-  _visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetAmbient(0.5);
-  _visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetLighting(_aSetLighting->isChecked());
-  _visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetInterpolation(_aSetFlatShading->isChecked()?VTK_FLAT:VTK_PHONG);
-  _visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetEdgeVisibility(_aSetEdgeVisibility->isChecked());
-  _visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetBackfaceCulling(_aBackfaceCulling->isChecked());
-  _visualizer->getCloudActorMap()->find(id)->second.actor->GetProperty()->SetFrontfaceCulling(_frontfaceCulling);
+#if VTK_MAJOR_VERSION >= 7
+  actor->GetProperty()->SetAmbient(0.1);
+#else
+  actor->GetProperty()->SetAmbient(0.5);
+#endif
+  actor->GetProperty()->SetLighting(_aSetLighting->isChecked());
+  actor->GetProperty()->SetInterpolation(_aSetFlatShading->isChecked()?VTK_FLAT:VTK_PHONG);
+  actor->GetProperty()->SetEdgeVisibility(_aSetEdgeVisibility->isChecked());
+  actor->GetProperty()->SetBackfaceCulling(_aBackfaceCulling->isChecked());
+  actor->GetProperty()->SetFrontfaceCulling(_frontfaceCulling);
   return true;
 }
 
@@ -1401,10 +1489,17 @@ bool CloudViewer::addOccupancyGridMap(
 	float ySize = float(map8U.rows) * resolution;
 
 	UDEBUG("resolution=%f, xSize=%f, ySize=%f, xMin=%f, yMin=%f", resolution, xSize, ySize, xMin, yMin);
+#if VTK_MAJOR_VERSION >= 7
+	if(_visualizer->getShapeActorMap()->find("map") != _visualizer->getShapeActorMap()->end())
+	{
+		_visualizer->removeShape("map");
+	}
+#else
 	if(_visualizer->getCloudActorMap()->find("map") != _visualizer->getCloudActorMap()->end())
 	{
 		_visualizer->removePointCloud("map");
 	}
+#endif
 
 	if(xSize > 0.0f && ySize > 0.0f)
 	{
@@ -1448,10 +1543,17 @@ bool CloudViewer::addOccupancyGridMap(
 
 void CloudViewer::removeOccupancyGridMap()
 {
+#if VTK_MAJOR_VERSION >= 7
+	if(_visualizer->getShapeActorMap()->find("map") != _visualizer->getShapeActorMap()->end())
+	{
+		_visualizer->removeShape("map");
+	}
+#else
 	if(_visualizer->getCloudActorMap()->find("map") != _visualizer->getCloudActorMap()->end())
 	{
 		_visualizer->removePointCloud("map");
 	}
+#endif
 }
 
 void CloudViewer::addOrUpdateCoordinate(
@@ -1472,10 +1574,10 @@ void CloudViewer::addOrUpdateCoordinate(
 	{
 		_coordinates.insert(id);
 #if PCL_VERSION_COMPARE(>=, 1, 7, 2)
-		_visualizer->addCoordinateSystem(scale, transform.toEigen3f(), id, foreground?3:2);
+		_visualizer->addCoordinateSystem(scale*_coordinateFrameScale, transform.toEigen3f(), id, foreground?3:2);
 #else
 		// Well, on older versions, just update the main coordinate
-		_visualizer->addCoordinateSystem(scale, transform.toEigen3f(), 0);
+		_visualizer->addCoordinateSystem(scale*_coordinateFrameScale, transform.toEigen3f(), 0);
 #endif
 	}
 }
@@ -2180,6 +2282,16 @@ void CloudViewer::setCameraAxisShown(bool shown)
 	_aShowCameraAxis->setChecked(shown);
 }
 
+double CloudViewer::getCoordinateFrameScale() const
+{
+	return _coordinateFrameScale;
+}
+
+void CloudViewer::setCoordinateFrameScale(double scale)
+{
+	_coordinateFrameScale = std::max(0.1, scale);
+}
+
 bool CloudViewer::isFrustumShown() const
 {
 	return _aShowFrustum->isChecked();
@@ -2286,15 +2398,26 @@ void CloudViewer::resetCamera()
 
 void CloudViewer::removeAllClouds()
 {
-	_addedClouds.clear();
-	_locators.clear();
-	_visualizer->removeAllPointClouds();
+	QMap<std::string, Transform> addedClouds = _addedClouds;
+	QList<std::string> ids = _addedClouds.keys();
+	for(QList<std::string>::iterator iter = ids.begin(); iter!=ids.end(); ++iter)
+	{
+		removeCloud(*iter);
+	}
+	UASSERT(_addedClouds.empty());
+	UASSERT(_locators.empty());
 }
 
 
 bool CloudViewer::removeCloud(const std::string & id)
 {
 	bool success = _visualizer->removePointCloud(id);
+#if VTK_MAJOR_VERSION >= 7
+	if(!success)
+	{
+		success = _visualizer->removeShape(id);
+	}
+#endif
 	_visualizer->removePointCloud(id+"-normals");
 	_addedClouds.remove(id); // remove after visualizer
 	_addedClouds.remove(id+"-normals");
@@ -2441,6 +2564,18 @@ void CloudViewer::setBackfaceCulling(bool enabled, bool frontfaceCulling)
 		iter->second.actor->GetProperty()->SetBackfaceCulling(_aBackfaceCulling->isChecked());
 		iter->second.actor->GetProperty()->SetFrontfaceCulling(_frontfaceCulling);
 	}
+#if VTK_MAJOR_VERSION >= 7
+	pcl::visualization::ShapeActorMapPtr shapeActorMap = _visualizer->getShapeActorMap();
+	for(pcl::visualization::ShapeActorMap::iterator iter=shapeActorMap->begin(); iter!=shapeActorMap->end(); ++iter)
+	{
+		vtkActor* actor = vtkActor::SafeDownCast (iter->second);
+		if(actor)
+		{
+			actor->GetProperty()->SetBackfaceCulling(_aBackfaceCulling->isChecked());
+			actor->GetProperty()->SetFrontfaceCulling(_frontfaceCulling);
+		}
+	}
+#endif
 	this->update();
 }
 
@@ -2515,6 +2650,17 @@ void CloudViewer::setLighting(bool on)
 	{
 		iter->second.actor->GetProperty()->SetLighting(_aSetLighting->isChecked());
 	}
+#if VTK_MAJOR_VERSION >= 7
+	pcl::visualization::ShapeActorMapPtr shapeActorMap = _visualizer->getShapeActorMap();
+	for(pcl::visualization::ShapeActorMap::iterator iter=shapeActorMap->begin(); iter!=shapeActorMap->end(); ++iter)
+	{
+		vtkActor* actor = vtkActor::SafeDownCast (iter->second);
+		if(actor && _addedClouds.contains(iter->first))
+		{
+			actor->GetProperty()->SetLighting(_aSetLighting->isChecked());
+		}
+	}
+#endif
 	this->update();
 }
 
@@ -2526,6 +2672,17 @@ void CloudViewer::setShading(bool on)
 	{
 		iter->second.actor->GetProperty()->SetInterpolation(_aSetFlatShading->isChecked()?VTK_FLAT:VTK_PHONG); // VTK_FLAT - VTK_GOURAUD - VTK_PHONG
 	}
+#if VTK_MAJOR_VERSION >= 7
+	pcl::visualization::ShapeActorMapPtr shapeActorMap = _visualizer->getShapeActorMap();
+	for(pcl::visualization::ShapeActorMap::iterator iter=shapeActorMap->begin(); iter!=shapeActorMap->end(); ++iter)
+	{
+		vtkActor* actor = vtkActor::SafeDownCast (iter->second);
+		if(actor && _addedClouds.contains(iter->first))
+		{
+			actor->GetProperty()->SetInterpolation(_aSetFlatShading->isChecked()?VTK_FLAT:VTK_PHONG); // VTK_FLAT - VTK_GOURAUD - VTK_PHONG
+		}
+	}
+#endif
 	this->update();
 }
 
@@ -2537,6 +2694,17 @@ void CloudViewer::setEdgeVisibility(bool visible)
 	{
 		iter->second.actor->GetProperty()->SetEdgeVisibility(_aSetEdgeVisibility->isChecked());
 	}
+#if VTK_MAJOR_VERSION >= 7
+	pcl::visualization::ShapeActorMapPtr shapeActorMap = _visualizer->getShapeActorMap();
+	for(pcl::visualization::ShapeActorMap::iterator iter=shapeActorMap->begin(); iter!=shapeActorMap->end(); ++iter)
+	{
+		vtkActor* actor = vtkActor::SafeDownCast (iter->second);
+		if(actor && _addedClouds.contains(iter->first))
+		{
+			actor->GetProperty()->SetEdgeVisibility(_aSetEdgeVisibility->isChecked());
+		}
+	}
+#endif
 	this->update();
 }
 
@@ -2837,6 +3005,19 @@ void CloudViewer::setCloudVisibility(const std::string & id, bool isVisible)
 	}
 	else
 	{
+#if VTK_MAJOR_VERSION >= 7
+		pcl::visualization::ShapeActorMapPtr shapeActorMap = _visualizer->getShapeActorMap();
+		pcl::visualization::ShapeActorMap::iterator iter = shapeActorMap->find(id);
+		if(iter != shapeActorMap->end())
+		{
+			vtkActor* actor = vtkActor::SafeDownCast (iter->second);
+			if(actor)
+			{
+				actor->SetVisibility(isVisible?1:0);
+				return;
+			}
+		}
+#endif
 		UERROR("Cannot find actor named \"%s\".", id.c_str());
 	}
 }
@@ -2851,6 +3032,18 @@ bool CloudViewer::getCloudVisibility(const std::string & id)
 	}
 	else
 	{
+#if VTK_MAJOR_VERSION >= 7
+		pcl::visualization::ShapeActorMapPtr shapeActorMap = _visualizer->getShapeActorMap();
+		pcl::visualization::ShapeActorMap::iterator iter = shapeActorMap->find(id);
+		if(iter != shapeActorMap->end())
+		{
+			vtkActor* actor = vtkActor::SafeDownCast (iter->second);
+			if(actor)
+			{
+				return actor->GetVisibility() != 0;
+			}
+		}
+#endif
 		UERROR("Cannot find actor named \"%s\".", id.c_str());
 	}
 	return false;
@@ -2867,20 +3060,39 @@ void CloudViewer::setCloudColorIndex(const std::string & id, int index)
 void CloudViewer::setCloudOpacity(const std::string & id, double opacity)
 {
 	double lastOpacity;
-	_visualizer->getPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_OPACITY, lastOpacity, id);
-	if(lastOpacity != opacity)
+	if(_visualizer->getPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_OPACITY, lastOpacity, id))
 	{
-		_visualizer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_OPACITY, opacity, id);
+		if(lastOpacity != opacity)
+		{
+			_visualizer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_OPACITY, opacity, id);
+		}
 	}
+#if VTK_MAJOR_VERSION >= 7
+	else
+	{
+		pcl::visualization::ShapeActorMap::iterator am_it = _visualizer->getShapeActorMap()->find (id);
+		if (am_it != _visualizer->getShapeActorMap()->end ())
+		{
+			vtkActor* actor = vtkActor::SafeDownCast (am_it->second);
+			if(actor)
+			{
+				actor->GetProperty ()->SetOpacity (opacity);
+				actor->Modified ();
+			}
+		}
+	}
+#endif
 }
 
 void CloudViewer::setCloudPointSize(const std::string & id, int size)
 {
 	double lastSize;
-	_visualizer->getPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, lastSize, id);
-	if((int)lastSize != size)
+	if(_visualizer->getPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, lastSize, id))
 	{
-		_visualizer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, (double)size, id);
+		if((int)lastSize != size)
+		{
+			_visualizer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, (double)size, id);
+		}
 	}
 }
 
@@ -3126,6 +3338,10 @@ bool CloudViewer::isIntensityRedColormap() const
 {
 	return _aSetIntensityRedColormap->isChecked();
 }
+bool CloudViewer::isIntensityRainbowColormap() const
+{
+	return _aSetIntensityRainbowColormap->isChecked();
+}
 float CloudViewer::getIntensityMax() const
 {
 	return _intensityAbsMax;
@@ -3134,6 +3350,18 @@ float CloudViewer::getIntensityMax() const
 void CloudViewer::setIntensityRedColormap(bool on)
 {
 	_aSetIntensityRedColormap->setChecked(on);
+	if(on)
+	{
+		_aSetIntensityRainbowColormap->setChecked(false);
+	}
+}
+void CloudViewer::setIntensityRainbowColormap(bool on)
+{
+	_aSetIntensityRainbowColormap->setChecked(on);
+	if(on)
+	{
+		_aSetIntensityRedColormap->setChecked(false);
+	}
 }
 void CloudViewer::setIntensityMax(float value)
 {
@@ -3411,6 +3639,15 @@ void CloudViewer::handleAction(QAction * a)
 	{
 		this->setCameraAxisShown(a->isChecked());
 	}
+	else if(a == _aSetFrameScale)
+	{
+		bool ok;
+		double value = QInputDialog::getDouble(this, tr("Set frame scale"), tr("Scale"), _coordinateFrameScale, 0.1, 999.0, 1, &ok);
+		if(ok)
+		{
+			this->setCoordinateFrameScale(value);
+		}
+	}
 	else if(a == _aShowFrustum)
 	{
 		this->setFrustumShown(a->isChecked());
@@ -3499,9 +3736,13 @@ void CloudViewer::handleAction(QAction * a)
 			this->setIntensityMax(value);
 		}
 	}
-	else if(a == _aShowNormals)
+	else if(a == _aSetIntensityRedColormap)
 	{
 		this->setIntensityRedColormap(_aSetIntensityRedColormap->isChecked());
+	}
+	else if(a == _aSetIntensityRainbowColormap)
+	{
+		this->setIntensityRainbowColormap(_aSetIntensityRainbowColormap->isChecked());
 	}
 	else if(a == _aSetBackgroundColor)
 	{

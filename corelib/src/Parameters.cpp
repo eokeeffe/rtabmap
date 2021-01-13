@@ -186,7 +186,8 @@ rtabmap::ParametersMap Parameters::getDefaultOdometryParameters(bool stereo, boo
 			group.compare("g2o") == 0 ||
 			group.compare("GTSAM") == 0 ||
 			(vis && (group.compare("Vis") == 0 || group.compare("PyMatcher") == 0 || group.compare("GMS") == 0)) ||
-			iter->first.compare(kRtabmapPublishRAMUsage())==0)
+			iter->first.compare(kRtabmapPublishRAMUsage())==0 ||
+			iter->first.compare(kRtabmapImagesAlreadyRectified())==0)
 		{
 			odomParameters.insert(*iter);
 		}
@@ -703,6 +704,12 @@ ParametersMap Parameters::parseArguments(int argc, char * argv[], bool onlyParam
 #endif
 				str = "With K4W2:";
 #ifdef RTABMAP_K4W2
+				std::cout << str << std::setw(spacing - str.size()) << "true" << std::endl;
+#else
+				std::cout << str << std::setw(spacing - str.size()) << "false" << std::endl;
+#endif
+				str = "With K4A:";
+#ifdef RTABMAP_K4A
 				std::cout << str << std::setw(spacing - str.size()) << "true" << std::endl;
 #else
 				std::cout << str << std::setw(spacing - str.size()) << "false" << std::endl;
